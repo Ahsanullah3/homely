@@ -2,48 +2,111 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gspread
-import requests as raw_requests
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
-# Set processing batch parameters
-BATCH_SIZE = 10         # Number of URLs per sheet write batch
-MAX_ROWS_PER_RUN = 50   # Maximum rows to process per workflow run
+# CONFIGURATION
+MAX_WORKERS = 10          # Number of simultaneous requests
+BATCH_SIZE = 20           # Number of rows written to Google Sheets at once
+MAX_ROWS_PER_RUN = 100    # Limit per GitHub Action run to prevent timeouts
 
-def trigger_github_dispatch():
-    """Triggers a repository dispatch event to auto-start the next workflow run."""
-    token = os.environ.get("GH_PAT_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    
-    if token and repo:
-        url = f"https://api.github.com/repos/{repo}/dispatches"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
+def main():
+    secret_key = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
+    if not secret_key:
+        raise ValueError("GCP_SERVICE_ACCOUNT_KEY environment variable is missing.")
+
+    gcp_credentials = json.loads(secret_key)
+    gc = gspread.service_account_from_dict(gcp_credentials)
+
+    # Open target Google Sheet (You can replace with gc.open_by_key("YOUR_SHEET_ID") if preferred)
+    sheet = gc.open("Homely Agents Data").sheet1
+
+    headers = ["URL", "Name", "Agency", "Phone", "Email", "Image URL", "Status"]
+    existing_headers = sheet.row_values(1)
+    if not existing_headers or existing_headers[0] != "URL":
+        sheet.update(range_name="D1:J1", values=[headers])
+
+    # Fetch data starting from Column D (index 4) and Column J (index 10 for Status)
+    urls_in_col_d = sheet.col_values(4)[1:]
+    statuses_in_col_j = sheet.col_values(10)[1:]
+
+    if not urls_in_col_d:
+        print("No URLs found in Column D to process.")
+        return
+
+    # Identify rows that need processing (smart resume)
+    tasks = []
+    start_row = 2
+    for idx, url in enumerate(urls_in_col_d):
+        current_row = start_row + idx
+        url_clean = url.strip()
+
+        if not url_clean.startswith("http"):
+            continue
+
+        status = statuses_in_col_j[idx] if idx < len(statuses_in_col_j) else ""
+        if status == "Scraped":
+            continue  # Skip already completed rows
+
+        tasks.append((current_row, url_clean))
+
+    if not tasks:
+        print("All URLs have already been scraped!")
+        return
+
+    # Limit rows per run to stay well within GitHub Action limits
+    current_batch_tasks = tasks[:MAX_ROWS_PER_RUN]
+    print(f"Starting high-speed concurrent scrape for {len(current_batch_tasks)} URLs using {MAX_WORKERS} threads...")
+
+    # Shared session for curl_cffi
+    session = requests.Session(impersonate="chrome120")
+
+    def scrape_single_url(task):
+        row_num, url = task
+        print(f"Scraping Row {row_num}: {url}")
+        row_data = extract_agent_data(session, url)
+        return row_num, {
+            "range": f"E{row_num}:J{row_num}",
+            "values": [row_data]
         }
-        data = {"event_type": "continue_scraping"}
-        res = raw_requests.post(url, headers=headers, json=data)
-        if res.status_code in [200, 204]:
-            print("\n Successfully auto-triggered the next GitHub Action workflow run!")
-        else:
-            print(f"\n Failed to trigger next run: HTTP {res.status_code} - {res.text}")
+
+    # Execute concurrent requests using ThreadPoolExecutor
+    updates = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(scrape_single_url, task): task for task in current_batch_tasks}
+        
+        for future in as_completed(futures):
+            try:
+                row_num, update_payload = future.result()
+                updates.append(update_payload)
+            except Exception as e:
+                print(f"Thread execution error: {e}")
+
+    # Batch write back to Google Sheets (Columns E through J)
+    if updates:
+        sheet.batch_update(updates)
+        print(f"\nSuccessfully batch-updated {len(updates)} records to Google Sheets!")
+
+    # Auto-trigger next run if there are still remaining unscraped URLs
+    remaining_tasks = tasks[MAX_ROWS_PER_RUN:]
+    if remaining_tasks:
+        print(f"{len(remaining_tasks)} URLs remaining. Triggering next GitHub workflow run...")
+        trigger_next_run()
     else:
-        print("\n Trigger skipped: GitHub token or repository context missing.")
+        print("All target URLs successfully processed!")
 
 def extract_agent_data(session, url):
-    """Fetches HTML and parses embedded Next.js JSON-LD schema or falls back to HTML tags."""
     try:
         response = session.get(url, timeout=15)
         if response.status_code != 200:
             return ["", "", "", "", "", f"Error: HTTP {response.status_code}"]
 
-        # Try extracting Next.js JSON-LD Schema
         match = re.search(r'(\{"@context":"https://schema\.org","@type":"RealEstateAgent".*?\})', response.text)
         if match:
             json_str = match.group(1).replace(r'\"', '"')
             data = json.loads(json_str)
-
             description = data.get("description", "")
             agency = description.split("- ")[-1].split(".")[0].strip() if "-" in description else ""
 
@@ -56,92 +119,26 @@ def extract_agent_data(session, url):
                 "Scraped"
             ]
 
-        # Fallback to standard HTML tag parsing
         soup = BeautifulSoup(response.text, "html.parser")
         h1 = soup.find("h1")
         name = h1.get_text(strip=True) if h1 else ""
-
         return [name, "", "", "", "", "Scraped (HTML Fallback)"]
 
     except Exception as e:
         return ["", "", "", "", "", f"Error: {str(e)}"]
 
-def main():
-    secret_key = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
-    if not secret_key:
-        raise ValueError("GCP_SERVICE_ACCOUNT_KEY environment variable is missing.")
-
-    gcp_credentials = json.loads(secret_key)
-    gc = gspread.service_account_from_dict(gcp_credentials)
-
-    # Connect to sheet by title
-    sheet = gc.open("Homely Agents Data").sheet1
-
-    # Ensure header setup
-    headers = ["URL", "Name", "Agency", "Phone", "Email", "Image URL", "Status"]
-    existing_headers = sheet.row_values(1)
-    if not existing_headers:
-        sheet.update(range_name="A1:G1", values=[headers])
-
-    # Fetch URLs and current statuses
-    urls_in_col_a = sheet.col_values(1)[1:]
-    statuses_in_col_g = sheet.col_values(7)[1:]
-
-    if not urls_in_col_a:
-        print("No URLs found in Column A to process.")
-        return
-
-    session = requests.Session(impersonate="chrome120")
+def trigger_next_run():
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
     
-    # Filter pending rows (skip already successfully scraped rows)
-    pending_items = []
-    for idx, url in enumerate(urls_in_col_a):
-        row_num = idx + 2
-        status = statuses_in_col_g[idx] if idx < len(statuses_in_col_g) else ""
-        
-        if status != "Scraped" and url.strip().startswith("http"):
-            pending_items.append((row_num, url.strip()))
-
-    total_pending = len(pending_items)
-    print(f"Total rows: {len(urls_in_col_a)} | Pending rows to scrape: {total_pending}")
-
-    if total_pending == 0:
-        print("All URLs have already been scraped!")
-        return
-
-    # Slice tasks for current run limit
-    items_to_process = pending_items[:MAX_ROWS_PER_RUN]
-    remaining_after_run = total_pending - len(items_to_process)
-
-    # Process items in batches
-    for i in range(0, len(items_to_process), BATCH_SIZE):
-        chunk = items_to_process[i:i + BATCH_SIZE]
-        batch_updates = []
-
-        print(f"\n--- Processing Batch {i//BATCH_SIZE + 1} ({len(chunk)} URLs) ---")
-
-        for row_num, url in chunk:
-            print(f"Row {row_num}: Extracting {url}")
-            row_data = extract_agent_data(session, url)
-
-            batch_updates.append({
-                "range": f"B{row_num}:G{row_num}",
-                "values": [row_data]
-            })
-
-            time.sleep(1)
-
-        # Write current batch immediately to Google Sheets
-        if batch_updates:
-            sheet.batch_update(batch_updates)
-            print(f"--> Batch {i//BATCH_SIZE + 1} written to Google Sheets!")
-
-    # Auto-trigger next run if pending items still remain
-    if remaining_after_run > 0:
-        print(f"\n{remaining_after_run} pending items remaining. Triggering next execution run...")
-        trigger_github_dispatch()
-    else:
-        print("\nAll target URLs have been successfully processed!")
+    if token and repo:
+        api_url = f"https://api.github.com/repos/{repo}/dispatches"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        data = {"event_type": "continue_scraping"}
+        requests.post(api_url, headers=headers, json=data)
 
 if __name__ == "__main__":
     main()
